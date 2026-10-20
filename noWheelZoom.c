@@ -1,6 +1,8 @@
 // noWheelZoom
 // Blocks mouse wheel scrolling while the target application (default: Warcraft III)
-// is the foreground window. Middle button, dragging and all other apps are not affected.
+// is the foreground window, and maps the two side mouse buttons to F1 and F2 there
+// (upper button -> hero 1, lower button -> hero 2).
+// Middle button, dragging and all other apps are not affected.
 // Build: build.bat (MinGW-w64) or build-msvc.bat (MSVC). See README.md.
 #define _WIN32_WINNT 0x0A00
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +22,26 @@
 #define WM_MOUSEHWHEEL 0x020E
 #endif
 
+#ifndef WM_XBUTTONDOWN
+#define WM_XBUTTONDOWN 0x020B
+#endif
+
+#ifndef WM_XBUTTONUP
+#define WM_XBUTTONUP 0x020C
+#endif
+
+#ifndef WM_XBUTTONDBLCLK
+#define WM_XBUTTONDBLCLK 0x020D
+#endif
+
+#ifndef XBUTTON1
+#define XBUTTON1 0x0001
+#endif
+
+#ifndef XBUTTON2
+#define XBUTTON2 0x0002
+#endif
+
 #ifndef PROCESS_NAME_NATIVE
 #define PROCESS_NAME_NATIVE 0x00000001
 #endif
@@ -36,14 +58,36 @@
 #define WM_ALREADY     (WM_APP + 2)
 
 #define IDM_PAUSE      1001
-#define IDM_EXIT       1002
+#define IDM_SIDE       1002
+#define IDM_EXIT       1003
+
+// Virtual key codes, spelled out to avoid relying on winuser.h names
+// that some older SDK headers still miss.
+#define KEY_F1         0x70
+#define KEY_F2         0x71
+
+// XBUTTON1 is the rear (lower) side button on most mice, XBUTTON2 the front
+// (upper) one. Hero 1 goes on the upper button, hero 2 on the lower.
+// Swap these two lines if your mouse is wired the other way round.
+#define VK_UPPER_BUTTON  KEY_F1
+#define VK_LOWER_BUTTON  KEY_F2
+
+// Marker written into every injected event, handy when debugging hooks.
+#define INJECT_TAG     ((ULONG_PTR)0x4E575A31)   // 'NWZ1'
 
 static HHOOK  g_hook = NULL;
 static HWND   g_wnd = NULL;
 static HICON  g_icon = NULL;
 static HANDLE g_mutex = NULL;
 static BOOL   g_paused = FALSE;
+static BOOL   g_sideKeys = TRUE;
 static BOOL   g_tray = FALSE;
+
+// Which side button is currently held down by us. Needed so that the release
+// always happens exactly once, even if focus changed in between.
+static BOOL   g_upperHeld = FALSE;
+static BOOL   g_lowerHeld = FALSE;
+
 static WCHAR  g_target[TARGET_LEN] = DEFAULT_TARGET;
 static WCHAR  g_path[PATH_BUF_LEN];
 static NOTIFYICONDATAW g_nid;
@@ -140,18 +184,105 @@ static BOOL TargetIsForeground(void)
     return ProcessIsTarget(pid);
 }
 
+// Inject one key transition. Called from the hook, so it must stay cheap:
+// a single SendInput of a single event, no allocation, no waiting.
+static void SendVirtualKey(WORD vk, BOOL down)
+{
+    INPUT in;
+
+    ZeroMemory(&in, sizeof(in));
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.wScan = 0;
+    in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    in.ki.time = 0;
+    in.ki.dwExtraInfo = INJECT_TAG;
+    SendInput(1, &in, sizeof(in));
+}
+
+// Drop every key we may still be holding. Called on pause, on exit and on
+// the side-keys toggle, otherwise F1/F2 would stay stuck down.
+static void ReleaseAllKeys(void)
+{
+    if (g_upperHeld) {
+        SendVirtualKey((WORD)VK_UPPER_BUTTON, FALSE);
+        g_upperHeld = FALSE;
+    }
+    if (g_lowerHeld) {
+        SendVirtualKey((WORD)VK_LOWER_BUTTON, FALSE);
+        g_lowerHeld = FALSE;
+    }
+}
+
 // Low level mouse hook. No allocations and no blocking here on purpose.
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
+    UINT msg;
+    MSLLHOOKSTRUCT *ms;
+    WORD button;
+    BOOL fg;
+
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
 
-    if (g_paused == FALSE) {
-        if ((UINT)wParam == WM_MOUSEWHEEL || (UINT)wParam == WM_MOUSEHWHEEL) {
-            if (TargetIsForeground())
-                return 1;   // swallow the event, the game never sees it
-        }
+    if (g_paused)
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    msg = (UINT)wParam;
+
+    // Wheel messages: swallow, both vertical and horizontal (tilt).
+    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
+        if (TargetIsForeground())
+            return 1;   // the game never sees it
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
     }
+
+    if (g_sideKeys == FALSE)
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    if (msg != WM_XBUTTONDOWN && msg != WM_XBUTTONUP && msg != WM_XBUTTONDBLCLK)
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    ms = (MSLLHOOKSTRUCT *)lParam;
+    button = HIWORD(ms->mouseData);
+    fg = TargetIsForeground();
+
+    // XBUTTON1 is the lower/rear button on most mice.
+    if (button == XBUTTON1) {
+        if (msg == WM_XBUTTONUP) {
+            // Release even if focus already left the game, so the key cannot
+            // stay stuck down; the event itself is not swallowed in that case.
+            if (g_lowerHeld) {
+                SendVirtualKey((WORD)VK_LOWER_BUTTON, FALSE);
+                g_lowerHeld = FALSE;
+            }
+        } else if (fg && g_lowerHeld == FALSE) {
+            // Down and double-click both land here; the guard stops a second
+            // key-down on a double click.
+            SendVirtualKey((WORD)VK_LOWER_BUTTON, TRUE);
+            g_lowerHeld = TRUE;
+        }
+        if (fg)
+            return 1;
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    }
+
+    // XBUTTON2 is the upper/front button on most mice.
+    if (button == XBUTTON2) {
+        if (msg == WM_XBUTTONUP) {
+            if (g_upperHeld) {
+                SendVirtualKey((WORD)VK_UPPER_BUTTON, FALSE);
+                g_upperHeld = FALSE;
+            }
+        } else if (fg && g_upperHeld == FALSE) {
+            SendVirtualKey((WORD)VK_UPPER_BUTTON, TRUE);
+            g_upperHeld = TRUE;
+        }
+        if (fg)
+            return 1;
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    }
+
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
@@ -205,6 +336,8 @@ static void ShowTrayMenu(void)
     if (menu == NULL)
         return;
     AppendMenuW(menu, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Pause");
+    AppendMenuW(menu, MF_STRING | (g_sideKeys ? MF_CHECKED : 0), IDM_SIDE,
+                L"Side buttons -> F1 / F2");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -230,12 +363,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_COMMAND:
         if (LOWORD(wParam) == IDM_PAUSE) {
             g_paused = (g_paused == FALSE);
+            if (g_paused)
+                ReleaseAllKeys();
             TraySetTip(g_paused ? L"noWheelZoom - paused" : L"noWheelZoom - active");
+        } else if (LOWORD(wParam) == IDM_SIDE) {
+            g_sideKeys = (g_sideKeys == FALSE);
+            if (g_sideKeys == FALSE)
+                ReleaseAllKeys();
         } else if (LOWORD(wParam) == IDM_EXIT) {
+            ReleaseAllKeys();
             DestroyWindow(g_wnd);
         }
         return 0;
     case WM_DESTROY:
+        ReleaseAllKeys();
         TrayRemove();
         PostQuitMessage(0);
         return 0;
