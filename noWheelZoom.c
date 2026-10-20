@@ -2,7 +2,8 @@
 // Blocks mouse wheel scrolling while the target application (default: Warcraft III)
 // is the foreground window, and maps the two side mouse buttons to F1 and F2 there
 // (upper button -> hero 1, lower button -> hero 2).
-// Middle button, dragging and all other apps are not affected.
+// Also swallows the left and right Windows keys there, so a stray Win press cannot
+// minimise the game. Middle button, dragging and all other apps are not affected.
 // Build: build.bat (MinGW-w64) or build-msvc.bat (MSVC). See README.md.
 #define _WIN32_WINNT 0x0A00
 #define WIN32_LEAN_AND_MEAN
@@ -59,12 +60,15 @@
 
 #define IDM_PAUSE      1001
 #define IDM_SIDE       1002
-#define IDM_EXIT       1003
+#define IDM_WIN        1003
+#define IDM_EXIT       1004
 
 // Virtual key codes, spelled out to avoid relying on winuser.h names
 // that some older SDK headers still miss.
 #define KEY_F1         0x70
 #define KEY_F2         0x71
+#define KEY_LWIN       0x5B
+#define KEY_RWIN       0x5C
 
 // XBUTTON1 is the rear (lower) side button on most mice, XBUTTON2 the front
 // (upper) one. Hero 1 goes on the upper button, hero 2 on the lower.
@@ -76,17 +80,23 @@
 #define INJECT_TAG     ((ULONG_PTR)0x4E575A31)   // 'NWZ1'
 
 static HHOOK  g_hook = NULL;
+static HHOOK  g_kbdHook = NULL;
 static HWND   g_wnd = NULL;
 static HICON  g_icon = NULL;
 static HANDLE g_mutex = NULL;
 static BOOL   g_paused = FALSE;
 static BOOL   g_sideKeys = TRUE;
+static BOOL   g_blockWin = TRUE;
 static BOOL   g_tray = FALSE;
 
 // Which side button is currently held down by us. Needed so that the release
 // always happens exactly once, even if focus changed in between.
 static BOOL   g_upperHeld = FALSE;
 static BOOL   g_lowerHeld = FALSE;
+
+// TRUE while we are swallowing a Windows key that we already swallowed on the
+// way down, so the matching release is swallowed too.
+static BOOL   g_winDown = FALSE;
 
 static WCHAR  g_target[TARGET_LEN] = DEFAULT_TARGET;
 static WCHAR  g_path[PATH_BUF_LEN];
@@ -286,6 +296,42 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
+// Low level keyboard hook. Only the two Windows keys are considered; every
+// other key passes through untouched, so hotkeys and typing are unaffected.
+static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    KBDLLHOOKSTRUCT *ks;
+
+    if (nCode != HC_ACTION)
+        return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+
+    if (g_paused || g_blockWin == FALSE)
+        return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+
+    ks = (KBDLLHOOKSTRUCT *)lParam;
+    if (ks->vkCode != KEY_LWIN && ks->vkCode != KEY_RWIN)
+        return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+
+    if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+        // Always swallow the release of a press we swallowed, even if focus
+        // already moved away: a lone Windows key release is what makes the
+        // shell pop the Start menu up on top of the game.
+        if (g_winDown) {
+            g_winDown = FALSE;
+            return 1;
+        }
+        return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+    }
+
+    // Key down and auto-repeat. Swallowing the down also disables every
+    // Win+key shell shortcut, because the system never sees the modifier.
+    if (TargetIsForeground()) {
+        g_winDown = TRUE;
+        return 1;
+    }
+    return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+}
+
 static void TrayAdd(void)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -338,6 +384,8 @@ static void ShowTrayMenu(void)
     AppendMenuW(menu, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Pause");
     AppendMenuW(menu, MF_STRING | (g_sideKeys ? MF_CHECKED : 0), IDM_SIDE,
                 L"Side buttons -> F1 / F2");
+    AppendMenuW(menu, MF_STRING | (g_blockWin ? MF_CHECKED : 0), IDM_WIN,
+                L"Block Win key");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -370,6 +418,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_sideKeys = (g_sideKeys == FALSE);
             if (g_sideKeys == FALSE)
                 ReleaseAllKeys();
+        } else if (LOWORD(wParam) == IDM_WIN) {
+            g_blockWin = (g_blockWin == FALSE);
+            // Forgetting the held state keeps the next Win release in sync.
+            if (g_blockWin == FALSE)
+                g_winDown = FALSE;
         } else if (LOWORD(wParam) == IDM_EXIT) {
             ReleaseAllKeys();
             DestroyWindow(g_wnd);
@@ -492,6 +545,19 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nSho
         return 1;
     }
 
+    // Second hook for the Windows keys. Both must live on this thread, the one
+    // that owns the message loop, or the low level callbacks never fire.
+    g_kbdHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, NULL, 0);
+    if (g_kbdHook == NULL) {
+        err = GetLastError();
+        UnhookWindowsHookEx(g_hook);
+        g_hook = NULL;
+        TrayRemove();
+        DestroyWindow(g_wnd);
+        ShowError(L"SetWindowsHookExW (keyboard)", err);
+        return 1;
+    }
+
     for (;;) {
         r = GetMessageW(&msg, NULL, 0, 0);
         if (r == 0 || r == -1)
@@ -500,6 +566,8 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nSho
         DispatchMessageW(&msg);
     }
 
+    if (g_kbdHook != NULL)
+        UnhookWindowsHookEx(g_kbdHook);
     if (g_hook != NULL)
         UnhookWindowsHookEx(g_hook);
     if (g_mutex != NULL)
